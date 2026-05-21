@@ -1,27 +1,30 @@
+import { useState } from 'react';
+import type { PrinterConfig } from '../vite-env';
+
 export default function SettingsPanel({
-  ip,
-  setIp,
-  accessCode,
-  setAccessCode,
-  serial,
-  setSerial,
-  onConnect,
-  error,
+  initial,
+  onSave,
   onBack,
+  error,
+  isFirstSetup = false,
 }: {
-  ip: string;
-  setIp: (v: string) => void;
-  accessCode: string;
-  setAccessCode: (v: string) => void;
-  serial: string;
-  setSerial: (v: string) => void;
-  onConnect: () => void;
-  error: string;
+  initial?: Partial<PrinterConfig>;
+  onSave: (config: Omit<PrinterConfig, 'id'>) => void;
   onBack?: () => void;
+  error?: string;
+  isFirstSetup?: boolean;
 }) {
+  const [nickname, setNickname] = useState(initial?.nickname ?? '');
+  const [ip, setIp] = useState(initial?.ip ?? '');
+  const [accessCode, setAccessCode] = useState(initial?.accessCode ?? '');
+  const [serial, setSerial] = useState(initial?.serial ?? '');
+
+  const isEdit = !!initial?.id;
+  const title = isFirstSetup ? 'Add Your Printer' : isEdit ? 'Edit Printer' : 'Add Printer';
+
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    onConnect();
+    onSave({ nickname: nickname.trim() || ip, ip, accessCode, serial });
   }
 
   return (
@@ -36,7 +39,7 @@ export default function SettingsPanel({
             ←
           </button>
         )}
-        <h1 className='font-semibold text-lg'>Printer Settings</h1>
+        <h1 className='font-semibold text-lg'>{title}</h1>
       </div>
 
       <div className='flex-1 p-6 flex flex-col gap-4'>
@@ -48,6 +51,16 @@ export default function SettingsPanel({
         )}
 
         <form onSubmit={handleSubmit} className='flex flex-col gap-4'>
+          <label className='flex flex-col gap-1'>
+            <span className='text-zinc-400 text-xs uppercase tracking-wider'>Nickname</span>
+            <input
+              className='bg-zinc-800 text-white rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-teal-500'
+              placeholder='e.g. Bambu X1 Carbon'
+              value={nickname}
+              onChange={(e) => setNickname(e.target.value)}
+            />
+          </label>
+
           <label className='flex flex-col gap-1'>
             <span className='text-zinc-400 text-xs uppercase tracking-wider'>Printer IP</span>
             <input
@@ -84,7 +97,7 @@ export default function SettingsPanel({
           <button
             type='submit'
             className='bg-teal-600 hover:bg-teal-500 text-white font-semibold rounded-lg py-3 transition-colors mt-2'>
-            Connect
+            {isEdit ? 'Save & Reconnect' : 'Connect'}
           </button>
         </form>
 

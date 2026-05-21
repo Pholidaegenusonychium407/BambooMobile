@@ -1,7 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from '@tauri-apps/plugin-notification';
 import type { PrinterStatus } from '../vite-env';
+import { hmsDescription } from '../utils/hmsErrors';
 import PullToRefresh from 'react-simple-pull-to-refresh';
 
 import Section from './Section';
@@ -11,16 +17,38 @@ import AmsView from './AmsView';
 import ExternalSpool from './ExternalSpool';
 import SpeedGauge from './SpeedGauge';
 import JogControls from './JogControls';
+import ErrorPopup from './ErrorPopup';
 
-export default function Dashboard({ onMenuOpen }: { onMenuOpen: () => void }) {
+async function notify(title: string, body: string) {
+  let granted = await isPermissionGranted();
+  if (!granted) {
+    const perm = await requestPermission();
+    granted = perm === 'granted';
+  }
+  if (granted) sendNotification({ title, body });
+}
+
+export default function Dashboard({
+  onMenuOpen,
+  serial,
+  deviceName,
+}: {
+  onMenuOpen: () => void;
+  serial?: string;
+  deviceName?: string;
+}) {
   const [status, setStatus] = useState<PrinterStatus | null>(null);
+  const [localName, setLocalName] = useState('');
   const [frameData, setFrameData] = useState<string | null>(null);
   const [printPreview, setPrintPreview] = useState<string | null>(null);
   const [lightOn, setLightOn] = useState(false);
   const [speedLevel, setSpeedLevel] = useState(2);
+  const [popupCodes, setPopupCodes] = useState<string[]>([]);
   const lightPendingUntil = useRef(0);
   const speedPendingUntil = useRef(0);
   const previewJobRef = useRef('');
+  const prevHmsRef = useRef<string[]>([]);
+  const prevGcodeStateRef = useRef('');
 
   useEffect(() => {
     const onVisible = () => {
@@ -39,20 +67,43 @@ export default function Dashboard({ onMenuOpen }: { onMenuOpen: () => void }) {
       .catch(() => {});
 
     const unlistenStatus = listen<PrinterStatus>('printer-status', (e) => {
-      setStatus(e.payload);
+      const payload = e.payload;
+      setStatus(payload);
       const now = Date.now();
-      if (now > lightPendingUntil.current) setLightOn(e.payload.chamber_light);
-      if (now > speedPendingUntil.current)
-        setSpeedLevel(e.payload.spd_lvl || 2);
+      if (now > lightPendingUntil.current) setLightOn(payload.chamber_light);
+      if (now > speedPendingUntil.current) setSpeedLevel(payload.spd_lvl || 2);
+
+      // Detect new HMS error codes
+      const newCodes = (payload.hms ?? []).filter(
+        (c) => !prevHmsRef.current.includes(c),
+      );
+      if (newCodes.length > 0) {
+        setPopupCodes(newCodes);
+        const body = newCodes.map((c) => hmsDescription(c, serial)).join('\n');
+        notify('Printer Alert', body);
+      }
+      prevHmsRef.current = payload.hms ?? [];
+
+      // Detect print completion
+      const prev = prevGcodeStateRef.current;
+      const next = payload.gcode_state;
+      if (prev === 'RUNNING' && next === 'FINISH') {
+        const jobName = payload.subtask_name || 'Your print';
+        notify('Print Complete', `${jobName} has finished printing.`);
+      }
+      prevGcodeStateRef.current = next;
     });
 
     const unlistenCamera = listen<string>('camera-frame', (e) =>
       setFrameData(`data:image/jpeg;base64,${e.payload}`),
     );
 
+    const unlistenName = listen<string>('printer-name', (e) => setLocalName(e.payload));
+
     return () => {
       unlistenStatus.then((f) => f());
       unlistenCamera.then((f) => f());
+      unlistenName.then((f) => f());
     };
   }, []);
 
@@ -106,7 +157,7 @@ export default function Dashboard({ onMenuOpen }: { onMenuOpen: () => void }) {
     status && (status.ams.length > 0 || status.vt_tray != null);
 
   return (
-    <div className='min-h-screen bg-zinc-950 text-white flex flex-col'>
+    <div className='min-h-screen bg-zinc-950 text-white flex flex-col relative'>
       <div
         className='sticky top-0 z-10 flex items-center justify-between px-4 pb-3 bg-zinc-900 border-b border-zinc-800 shrink-0'
         style={{ paddingTop: 'calc(env(safe-area-inset-top, 0px) + 0.75rem)' }}>
@@ -127,7 +178,12 @@ export default function Dashboard({ onMenuOpen }: { onMenuOpen: () => void }) {
             />
           </svg>
         </button>
-        <h1 className='font-semibold text-lg'>BambooMobile</h1>
+        <div className='flex flex-col items-center'>
+          <h1 className='font-semibold text-lg'>BambooMobile</h1>
+          <span className='text-xs text-yellow-400 font-mono'>
+            prop: "{deviceName ?? ''}" | event: "{localName}"
+          </span>
+        </div>
       </div>
 
       <PullToRefresh
@@ -165,6 +221,35 @@ export default function Dashboard({ onMenuOpen }: { onMenuOpen: () => void }) {
               lightOn={lightOn}
               toggleLight={toggleLight}
             />
+          )}
+
+          {status && status.hms.length > 0 && (
+            <div className='flex flex-col gap-2'>
+              {status.hms.map((code) => (
+                <div
+                  key={code}
+                  className='flex items-start gap-3 bg-red-950 border border-red-700 rounded-xl px-4 py-3'>
+                  <svg
+                    className='w-5 h-5 text-red-400 shrink-0 mt-0.5'
+                    fill='none'
+                    viewBox='0 0 24 24'
+                    stroke='currentColor'
+                    strokeWidth={2}>
+                    <path
+                      strokeLinecap='round'
+                      strokeLinejoin='round'
+                      d='M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z'
+                    />
+                  </svg>
+                  <div className='flex flex-col gap-0.5 min-w-0'>
+                    <p className='text-red-300 text-sm font-medium leading-snug'>
+                      {hmsDescription(code, serial)}
+                    </p>
+                    <p className='text-red-600 text-xs font-mono'>{code}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
           )}
 
           <div className='flex flex-col bg-zinc-800 rounded-xl overflow-hidden'>
@@ -349,6 +434,8 @@ export default function Dashboard({ onMenuOpen }: { onMenuOpen: () => void }) {
           )}
         </div>
       </PullToRefresh>
+
+      {/* <ErrorPopup codes={popupCodes} serial={serial} onDismiss={() => setPopupCodes([])} /> */}
     </div>
   );
 }

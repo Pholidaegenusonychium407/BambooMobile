@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use socket2::{Domain, Protocol, Socket, Type};
 use rumqttc::{AsyncClient, ConnectReturnCode, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -70,6 +71,8 @@ pub struct PrinterStatus {
     pub spd_lvl: u8,
     pub subtask_name: String,
     pub task_id: String,
+    pub hms: Vec<String>,
+    pub device_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -117,6 +120,9 @@ pub struct FileEntry {
 
 fn parse_status(payload: &[u8], status: &mut PrinterStatus) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else { return };
+
+    // device_name is set via SSDP discovery (DevName.bambu.com), not MQTT.
+
     let Some(p) = v.get("print") else { return };
 
     macro_rules! f64_field {
@@ -237,6 +243,27 @@ fn parse_status(payload: &[u8], status: &mut PrinterStatus) {
             None
         };
     }
+
+    // HMS error codes — each entry has `attr` and `code` (both u32 hex strings).
+    // Combine them into the 8-char key used in errors.json, e.g. "03008001".
+    // Only update hms when the key is present. Bambu sends incremental updates
+    // so most messages omit `hms` entirely — clearing on absence would cause
+    // errors to disappear after a single tick.
+    if let Some(hms_val) = p.get("hms") {
+        status.hms = hms_val
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|entry| {
+                        let attr = entry.get("attr").and_then(|v| v.as_u64())?;
+                        let code = entry.get("code").and_then(|v| v.as_u64())?;
+                        let s = format!("{:08X}{:08X}", attr, code);
+                        Some(format!("{}-{}-{}-{}", &s[0..4], &s[4..8], &s[8..12], &s[12..16]))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
 }
 
 fn stage_name(stg: u64) -> String {
@@ -257,6 +284,183 @@ fn stage_name(stg: u64) -> String {
         _  => "Working",
     }
     .to_owned()
+}
+
+// ── SSDP: retrieve DevName.bambu.com via unicast M-SEARCH + multicast NOTIFY ──
+//
+// Unicast M-SEARCH (primary): sent directly to printer_ip:1900 — works over
+// Tailscale subnet routes and any network where the IP is reachable.
+// Multicast NOTIFY (bonus): listen on 239.255.255.250:1900 for the printer's
+// periodic 5-second broadcasts — local network only.
+
+fn ssdp_extract_name(msg: &str, serial_upper: &str) -> Option<String> {
+    // Accept the packet if it mentions our serial (case-insensitive) OR if serial
+    // is empty. This handles the rare case of a misconfigured serial entry.
+    if !serial_upper.is_empty() && !msg.to_uppercase().contains(serial_upper) {
+        return None;
+    }
+    for line in msg.lines() {
+        if let Some(name) = line.trim().strip_prefix("DevName.bambu.com:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    None
+}
+
+async fn ssdp_apply(name: String, status: &Arc<Mutex<PrinterStatus>>, app: &AppHandle) {
+    let mut st = status.lock().await;
+    if st.device_name != name {
+        st.device_name = name.clone();
+        let _ = app.emit("printer-name", &name);
+    }
+}
+
+async fn ssdp_name_loop(ip: String, serial: String, status: Arc<Mutex<PrinterStatus>>, app: AppHandle) {
+    let serial_upper = serial.to_uppercase();
+    let msearch = concat!(
+        "M-SEARCH * HTTP/1.1\r\n",
+        "HOST: 239.255.255.250:1900\r\n",
+        "MAN: \"ssdp:discover\"\r\n",
+        "MX: 1\r\n",
+        "ST: urn:bambulab-com:device:3dprinter:1\r\n",
+        "\r\n",
+    );
+
+    let _ = app.emit("ssdp-debug", format!("[ssdp] starting for printer {}", ip));
+
+    // Multicast listener on :1900
+    {
+        let su = serial_upper.clone(); let st = status.clone(); let ap = app.clone();
+        tokio::spawn(async move { ssdp_multicast_listen(su, st, ap).await; });
+    }
+    // Listener on port 2021 (Bambu direct broadcast port)
+    {
+        let su = serial_upper.clone(); let st = status.clone(); let ap = app.clone();
+        tokio::spawn(async move { ssdp_port_listen(2021, su, st, ap).await; });
+    }
+
+    // M-SEARCH loop: send to the SSDP multicast group (triggers LAN response)
+    // AND unicast directly to the printer (for Tailscale where multicast can't route).
+    let targets = [
+        "239.255.255.250:1900".to_string(), // multicast — standard SSDP, works on LAN
+        format!("{}:1900", ip),             // unicast to printer — works over Tailscale
+        format!("{}:2021", ip),             // unicast on Bambu's alternate port
+    ];
+    loop {
+        match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Err(e) => { let _ = app.emit("ssdp-debug", format!("[msearch] bind failed: {}", e)); }
+            Ok(sock) => {
+                for target in &targets {
+                    match sock.send_to(msearch.as_bytes(), target).await {
+                        Err(e) => { let _ = app.emit("ssdp-debug", format!("[msearch] send to {} failed: {}", target, e)); }
+                        Ok(_)  => { let _ = app.emit("ssdp-debug", format!("[msearch] sent to {}", target)); }
+                    }
+                }
+                // Collect any responses that arrive within 5 s
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut buf = vec![0u8; 2048];
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() { break; }
+                    match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
+                        Ok(Ok((len, src))) => {
+                            let msg = String::from_utf8_lossy(&buf[..len]).to_string();
+                            let _ = app.emit("ssdp-debug", format!("[msearch] response from {}: {}", src, &msg[..msg.len().min(300)]));
+                            if let Some(name) = ssdp_extract_name(&msg, &serial_upper) {
+                                ssdp_apply(name, &status, &app).await;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+async fn ssdp_port_listen(port: u16, serial_upper: String, status: Arc<Mutex<PrinterStatus>>, app: AppHandle) {
+    use std::net::SocketAddr;
+    let std_socket = (|| -> std::io::Result<std::net::UdpSocket> {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_reuse_address(true)?;
+        #[cfg(unix)] sock.set_reuse_port(true)?;
+        sock.set_broadcast(true)?;
+        sock.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+        Ok(sock.into())
+    })();
+    let std_socket = match std_socket {
+        Ok(s) => { let _ = app.emit("ssdp-debug", format!("[port{}] listening", port)); s }
+        Err(e) => { let _ = app.emit("ssdp-debug", format!("[port{}] bind failed: {}", port, e)); return; }
+    };
+    std_socket.set_nonblocking(true).ok();
+    let socket = match tokio::net::UdpSocket::from_std(std_socket) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let (len, src) = match socket.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(_) => { tokio::time::sleep(std::time::Duration::from_secs(2)).await; continue; }
+        };
+        let msg = String::from_utf8_lossy(&buf[..len]).to_string();
+        let _ = app.emit("ssdp-debug", format!("[port{}] packet from {}: {}", port, src, &msg[..msg.len().min(200)]));
+        if let Some(name) = ssdp_extract_name(&msg, &serial_upper) {
+            ssdp_apply(name, &status, &app).await;
+        }
+    }
+}
+
+async fn ssdp_multicast_listen(serial_upper: String, status: Arc<Mutex<PrinterStatus>>, app: AppHandle) {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    let std_socket = (|| -> std::io::Result<std::net::UdpSocket> {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sock.set_reuse_port(true)?;
+        sock.bind(&SocketAddr::from(([0, 0, 0, 0], 1900)).into())?;
+        Ok(sock.into())
+    })();
+
+    let std_socket = match std_socket {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = app.emit("ssdp-debug", format!("[multicast] bind :1900 failed: {}", e));
+            return;
+        }
+    };
+    std_socket.set_nonblocking(true).ok();
+    let multicast = Ipv4Addr::new(239, 255, 255, 250);
+    match std_socket.join_multicast_v4(&multicast, &Ipv4Addr::UNSPECIFIED) {
+        Ok(_) => { let _ = app.emit("ssdp-debug", "[multicast] joined 239.255.255.250 on :1900".to_string()); }
+        Err(e) => { let _ = app.emit("ssdp-debug", format!("[multicast] join failed: {}", e)); }
+    }
+
+    let socket = match tokio::net::UdpSocket::from_std(std_socket) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = app.emit("ssdp-debug", format!("[multicast] tokio wrap failed: {}", e));
+            return;
+        }
+    };
+
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let (len, src) = match socket.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(_) => { tokio::time::sleep(std::time::Duration::from_secs(2)).await; continue; }
+        };
+        let msg = String::from_utf8_lossy(&buf[..len]).to_string();
+        let _ = app.emit("ssdp-debug", format!("[multicast] packet from {}: {}", src, &msg[..msg.len().min(200)]));
+        if let Some(name) = ssdp_extract_name(&msg, &serial_upper) {
+            ssdp_apply(name, &status, &app).await;
+        }
+    }
 }
 
 // ── Camera: MJPG over TLS on port 6000 ───────────────────────────────────────
@@ -411,6 +615,9 @@ async fn connect_printer(
         let pushall = serde_json::json!({
             "pushing": {"sequence_id": "0", "command": "pushall", "version": 1}
         }).to_string();
+        let get_version = serde_json::json!({
+            "info": {"sequence_id": "0", "command": "get_version"}
+        }).to_string();
 
         loop {
             match eventloop.poll().await {
@@ -420,14 +627,26 @@ async fn connect_printer(
                     let _ = mqtt_client_c.subscribe(&report_topic, QoS::AtMostOnce).await;
                 }
                 Ok(Event::Incoming(Packet::SubAck(_))) => {
-                    // Subscription confirmed — safe to request a fresh status dump.
+                    // Subscription confirmed — safe to publish. Send both the full
+                    // status dump and a get_version to retrieve the device name.
                     let _ = mqtt_client_c
                         .publish(&req_topic, QoS::AtMostOnce, false, pushall.clone())
                         .await;
+                    let _ = mqtt_client_c
+                        .publish(&req_topic, QoS::AtMostOnce, false, get_version.clone())
+                        .await;
                 }
                 Ok(Event::Incoming(Packet::Publish(msg))) => {
+                    // Emit raw payload for the debug page before any parsing.
+                    if let Ok(raw) = std::str::from_utf8(&msg.payload) {
+                        let _ = app_c.emit("mqtt-raw", raw);
+                    }
                     let mut st = status_c.lock().await;
+                    let prev_name = st.device_name.clone();
                     parse_status(&msg.payload, &mut st);
+                    if st.device_name != prev_name && !st.device_name.is_empty() {
+                        let _ = app_c.emit("printer-name", &st.device_name);
+                    }
                     let _ = app_c.emit("printer-status", st.clone());
                 }
                 Err(_) => {
@@ -441,9 +660,14 @@ async fn connect_printer(
     drop(handle);
 
     // Camera: MJPG over TLS on port 6000
-    let camera_handle = tokio::spawn(camera_loop(ip.clone(), access_code.clone(), app));
+    let camera_handle = tokio::spawn(camera_loop(ip.clone(), access_code.clone(), app.clone()));
     abort_handles.push(camera_handle.abort_handle());
     drop(camera_handle);
+
+    // SSDP: unicast M-SEARCH + multicast NOTIFY to get the user-set printer name
+    let ssdp_handle = tokio::spawn(ssdp_name_loop(ip.clone(), serial.clone(), status.clone(), app));
+    abort_handles.push(ssdp_handle.abort_handle());
+    drop(ssdp_handle);
 
     *conn = Some(ConnectionHandles {
         ip,
@@ -1201,6 +1425,35 @@ async fn delete_entry(path: String, state: TauriState<'_, AppState>) -> Result<(
     .map_err(|e| e.to_string())?
 }
 
+// ── Debug helpers ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn debug_send_request(payload: String, state: TauriState<'_, AppState>) -> Result<(), String> {
+    let conn = state.connection.lock().await;
+    let c = conn.as_ref().ok_or("Not connected")?;
+    let topic = format!("device/{}/request", c.serial);
+    c.mqtt_client
+        .publish(&topic, QoS::AtMostOnce, false, payload)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ── Dev-only helpers ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn inject_test_hms(code: String, app: AppHandle, state: TauriState<'_, AppState>) -> Result<(), String> {
+    let arc = {
+        let conn = state.connection.lock().await;
+        conn.as_ref().map(|c| c.status.clone())
+    };
+    if let Some(arc) = arc {
+        let mut st = arc.lock().await.clone();
+        st.hms = if code.is_empty() { vec![] } else { vec![code] };
+        let _ = app.emit("printer-status", st);
+    }
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1209,6 +1462,7 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             connection: Mutex::new(None),
             ftp: Arc::new(std::sync::Mutex::new(None)),
@@ -1227,6 +1481,8 @@ pub fn run() {
             fetch_thumbnail,
             fetch_print_preview,
             download_file,
+            inject_test_hms,
+            debug_send_request,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

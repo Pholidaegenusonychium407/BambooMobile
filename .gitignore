@@ -13,6 +13,12 @@ dist
 dist-ssr
 *.local
 
+# Android signing secrets
+.env.android
+
+# Built APKs moved to project root by build-android.sh
+*.apk
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

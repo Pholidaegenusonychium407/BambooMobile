@@ -1,5 +1,5 @@
 import type { PrinterStatus } from '../vite-env';
-import { fmtRemaining } from '../utils/printer';
+import { fmtRemaining, gcodeLabel } from '../utils/printer';
 
 function ProgressBar({ percent }: { percent: number }) {
   return (
@@ -25,10 +25,12 @@ export default function PrintStatusCard({
   lightOn: boolean;
   toggleLight: () => void;
 }) {
-  // const { text, dot } = gcodeLabel(status.gcode_state);
+  const { text: stateLabel, dot: stateDot } = gcodeLabel(status.gcode_state);
   const isPrinting = status.gcode_state === 'RUNNING';
   const isPaused = status.gcode_state === 'PAUSE';
   const isActive = isPrinting || isPaused;
+  const isFinished = status.gcode_state === 'FINISH';
+  const isFailed = status.gcode_state === 'FAILED';
 
   return (
     <div className='flex flex-col gap-4 p-4 bg-zinc-800 rounded-xl '>
@@ -50,20 +52,36 @@ export default function PrintStatusCard({
           {status?.subtask_name && (
             <span className='my-auto opacity-75'>{status.subtask_name}</span>
           )}
-          <div className='grid grid-cols-[auto_auto] justify-between gap-2 w-full'>
-            <span className='w-full'>Printed Layers</span>
-            <span className='text-end'>
-              {status.layer_num}/{status.total_layer_num}
-            </span>
-            <span className='text-2xl font-bold text-green-300'>
-              {status.progress}%
-            </span>
-            <span className='text-end'>
-              {fmtRemaining(status.remaining_mins)}
-            </span>
-
-            <ProgressBar percent={status.progress} />
-          </div>
+          {isActive ? (
+            <div className='grid grid-cols-[auto_auto] justify-between gap-2 w-full'>
+              <span className='w-full'>Printed Layers</span>
+              <span className='text-end'>
+                {status.layer_num}/{status.total_layer_num}
+              </span>
+              <span className='text-2xl font-bold text-green-300'>
+                {status.progress}%
+              </span>
+              <span className='text-end'>
+                {fmtRemaining(status.remaining_mins)}
+              </span>
+              <ProgressBar percent={status.progress} />
+            </div>
+          ) : (
+            <div className='flex items-center gap-3'>
+              <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${stateDot}`} />
+              <div className='flex flex-col'>
+                <span className='text-white font-semibold'>{stateLabel}</span>
+                {(isFinished || isFailed) && status.total_layer_num > 0 && (
+                  <span className='text-zinc-400 text-sm'>
+                    {status.layer_num} / {status.total_layer_num} layers
+                  </span>
+                )}
+                {!isFinished && !isFailed && status.stage && status.stage !== 'Idle' && (
+                  <span className='text-zinc-400 text-sm'>{status.stage}</span>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
       <div className='grid grid-cols-[1fr_2px_1fr_2px_1fr] gap-2 pt-4 text-zinc-400 tracking-wide font-semibold'>

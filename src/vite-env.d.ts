@@ -1,5 +1,13 @@
 /// <reference types="vite/client" />
 
+export interface PrinterConfig {
+  id: string;
+  nickname: string;
+  ip: string;
+  accessCode: string;
+  serial: string;
+}
+
 export interface AmsTray {
   id: number;
   tray_type: string;
@@ -30,4 +38,6 @@ export interface PrinterStatus {
   spd_lvl: number;
   subtask_name: string;
   task_id: string;
+  hms: string[];
+  device_name: string;
 }
