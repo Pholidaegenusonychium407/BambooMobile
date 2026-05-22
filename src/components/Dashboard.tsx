@@ -185,35 +185,6 @@ export default function Dashboard({
         }
         className='flex-1 overflow-y-auto'>
         <div className='flex flex-col gap-3 p-4 pb-8'>
-          <div className='rounded-xl overflow-hidden bg-zinc-900 aspect-video flex items-center justify-center shrink-0'>
-            {frameData ?
-              <img
-                src={frameData}
-                className='w-full h-full object-cover'
-                alt='Live camera'
-              />
-            : <div className='flex flex-col items-center gap-2 text-center px-6'>
-                <span className='text-3xl'>📷</span>
-                <p className='text-zinc-400 text-sm font-medium'>
-                  Connecting to camera…
-                </p>
-                <p className='text-zinc-600 text-xs'>
-                  Waiting for stream on port 6000
-                </p>
-              </div>
-            }
-          </div>
-
-          {status && (
-            <PrintStatusCard
-              status={status}
-              printPreview={printPreview}
-              onCommand={sendCommand}
-              lightOn={lightOn}
-              toggleLight={toggleLight}
-            />
-          )}
-
           {status && status.hms.length > 0 && (
             <div className='flex flex-col gap-2'>
               {status.hms.map((code) => (
@@ -241,6 +212,35 @@ export default function Dashboard({
                 </div>
               ))}
             </div>
+          )}
+
+          <div className='rounded-xl overflow-hidden bg-zinc-900 aspect-video flex items-center justify-center shrink-0'>
+            {frameData ?
+              <img
+                src={frameData}
+                className='w-full h-full object-cover'
+                alt='Live camera'
+              />
+            : <div className='flex flex-col items-center gap-2 text-center px-6'>
+                <span className='text-3xl'>📷</span>
+                <p className='text-zinc-400 text-sm font-medium'>
+                  Connecting to camera…
+                </p>
+                <p className='text-zinc-600 text-xs'>
+                  Waiting for stream on port 6000
+                </p>
+              </div>
+            }
+          </div>
+
+          {status && (
+            <PrintStatusCard
+              status={status}
+              printPreview={printPreview}
+              onCommand={sendCommand}
+              lightOn={lightOn}
+              toggleLight={toggleLight}
+            />
           )}
 
           <div className='flex flex-col bg-zinc-800 rounded-xl overflow-hidden'>
